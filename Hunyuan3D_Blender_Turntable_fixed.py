@@ -6,7 +6,6 @@
 #     "diffusers==0.39.0",
 #     "einops",
 #     "huggingface-hub==1.24.0",
-#     "hy3dgen==2.0.2",
 #     "mathutils==5.1.0",
 #     "numpy==2.5.1",
 #     "omegaconf==2.3.1",
@@ -15,7 +14,7 @@
 #     "pygltflib==1.16.5",
 #     "pymeshlab",
 #     "requests==2.34.2",
-#     "torch==2.11.0",
+#     "torch==2.13.0",
 #     "transformers",
 #     "trimesh==4.12.2",
 #     "xatlas==0.0.11",
@@ -188,6 +187,54 @@ def install_texgen(hy3d_ready):
 
 
 @app.cell
+def checkpoint_security():
+    import json as _json
+    import stat as _stat
+    from pathlib import Path as _Path, PureWindowsPath as _WindowsPath
+
+    def validate_model_snapshot(directory):
+        """Reject escaping shard paths and special files before any model loads.
+
+        Use snapshot_download(local_dir=...) so model files are materialized,
+        rather than symlinks into the shared Hugging Face cache. This guards
+        Accelerate's unpatched checkpoint-index handling at the notebook boundary.
+        """
+        _root = _Path(directory).resolve(strict=True)
+        for _file in _root.rglob("*"):
+            _mode = _file.lstat().st_mode
+            if _stat.S_ISDIR(_mode):
+                continue
+            if not _stat.S_ISREG(_mode):
+                raise ValueError("Model snapshot contains a symlink or special file; refusing to load it")
+            if _file.suffix != ".json":
+                continue
+            if _file.stat().st_size > 8 * 1024 * 1024:
+                raise ValueError("Model JSON exceeds the 8 MiB validation limit")
+            _document = _json.loads(_file.read_text(encoding="utf-8"))
+            if not isinstance(_document, dict):
+                if _file.name.endswith(".index.json"):
+                    raise ValueError("Checkpoint index must be an object")
+                continue
+            if "weight_map" not in _document and not _file.name.endswith(".index.json"):
+                continue
+            _weights = _document.get("weight_map", _document)
+            if not isinstance(_weights, dict):
+                raise ValueError("Checkpoint weight_map must be an object")
+            _folder = _file.parent.resolve(strict=True)
+            for _shard in _weights.values():
+                if (not isinstance(_shard, str) or not _shard or
+                        _Path(_shard).is_absolute() or _WindowsPath(_shard).drive or
+                        "\\" in _shard or ".." in _Path(_shard).parts):
+                    raise ValueError("Checkpoint index contains an unsafe shard path")
+                _target = (_folder / _shard).resolve(strict=True)
+                if not _target.is_relative_to(_folder) or not _target.is_file():
+                    raise ValueError("Checkpoint shard must be a regular file inside its checkpoint folder")
+        return _root
+
+    return (validate_model_snapshot,)
+
+
+@app.cell
 def imports(hy3d_ready, texgen_ready):
     import math
     import shutil
@@ -204,6 +251,7 @@ def imports(hy3d_ready, texgen_ready):
     import torch
     from mathutils import Vector
     from PIL import Image
+    from huggingface_hub import snapshot_download
     from hy3dgen.shapegen import (
         DegenerateFaceRemover,
         FaceReducer,
@@ -239,6 +287,7 @@ def imports(hy3d_ready, texgen_ready):
         np,
         requests,
         shutil,
+        snapshot_download,
         subprocess,
     )
 
@@ -254,6 +303,7 @@ def config(Path):
     OUTPUT_MP4 = OUTPUT_DIR / "hunyuan_turntable.mp4"
 
     MODEL_ID = "tencent/Hunyuan3D-2"
+    MODEL_REVISION = "9cd649ba6913f7a852e3286bad86bfa9a2d83dcf"
     MODEL_SUBFOLDER = "hunyuan3d-dit-v2-0-turbo"
     NUM_INFERENCE_STEPS = 20
     GUIDANCE_SCALE = 5.0
@@ -280,6 +330,7 @@ def config(Path):
         GUIDANCE_SCALE,
         INPUT_IMAGE,
         MODEL_ID,
+        MODEL_REVISION,
         MODEL_SUBFOLDER,
         NUM_INFERENCE_STEPS,
         OUTPUT_DIR,
@@ -381,6 +432,7 @@ def generate(
     Hunyuan3DPaintPipeline,
     Image,
     MODEL_ID,
+    MODEL_REVISION,
     MODEL_SUBFOLDER,
     NUM_INFERENCE_STEPS,
     OUTPUT_DIR,
@@ -393,7 +445,9 @@ def generate(
     mo,
     np,
     regenerate,
+    snapshot_download,
     texgen_ready,
+    validate_model_snapshot,
 ):
 
     _should_run = bool(regenerate.value) or (not GENERATED_GLB.exists())
@@ -561,10 +615,24 @@ def generate(
 
 
     if _should_run:
+        # Download only an immutable, named model revision into real local files.
+        # Validate all checkpoint indexes before Hunyuan/Diffusers/Accelerate
+        # can interpret shard filenames. Never fall back to a mutable Hub ref.
+        _patterns = [f"{MODEL_SUBFOLDER}/*"]
+        if texgen_ready and Hunyuan3DPaintPipeline is not None:
+            _patterns += ["hunyuan3d-delight-v2-0/*", "hunyuan3d-paint-v2-0/*"]
+        _model_path = snapshot_download(
+            repo_id=MODEL_ID,
+            revision=MODEL_REVISION,
+            local_dir=str(OUTPUT_DIR / "models" / MODEL_REVISION),
+            allow_patterns=_patterns,
+        )
+        validate_model_snapshot(_model_path)
         mo.status.toast("Generating mesh", description="Hunyuan3D-2 turbo on CUDA...")
         shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-            MODEL_ID,
+            _model_path,
             subfolder=MODEL_SUBFOLDER,
+            use_safetensors=True,
         )
         shape_pipeline.to("cuda")
         mesh = shape_pipeline(
@@ -600,7 +668,7 @@ def generate(
                 _paint_image = Image.fromarray(
                     np.clip(_paint_rgb, 0, 255).astype(np.uint8), mode="RGB"
                 ).convert("RGBA")
-                _paint = Hunyuan3DPaintPipeline.from_pretrained(MODEL_ID)
+                _paint = Hunyuan3DPaintPipeline.from_pretrained(_model_path)
                 mesh = _paint(mesh, image=_paint_image)
                 print("Textured mesh visual:", type(getattr(mesh, "visual", None)).__name__)
                 _paint_ok = True
